@@ -144,10 +144,9 @@ function templateLibClient(baseUrl: string, authType: string, authHeader: string
     ? `"Authorization": \`Bearer \${token}\``
     : `"${authHeader}": token`;
 
-  return `import { getToken } from "./config.js";
+  return `import { getToken, BASE_URL } from "./config.js";
 import { CliError } from "./errors.js";
 
-const BASE_URL = "${baseUrl}";
 const TIMEOUT_MS = 30_000;
 
 function buildHeaders(): Record<string, string> {
