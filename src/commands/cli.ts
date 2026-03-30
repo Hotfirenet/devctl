@@ -69,39 +69,143 @@ function templateTsConfig(): string {
 }
 
 function templateLibConfig(name: string): string {
+  const upper = name.toUpperCase();
   return `import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
 
 const CONFIG_DIR = join(homedir(), ".config", "tokens");
-const TOKEN_FILE = join(CONFIG_DIR, "${name}-cli");
+const PROFILES_FILE = join(CONFIG_DIR, "${name}-cli-profiles.json");
 
-export function getToken(): string | null {
-  if (!existsSync(TOKEN_FILE)) return null;
-  return readFileSync(TOKEN_FILE, "utf-8").trim() || null;
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+export interface Profile {
+  url: string;
+  token: string;
 }
 
-export function saveToken(token: string): void {
-  mkdirSync(CONFIG_DIR, { recursive: true });
-  writeFileSync(TOKEN_FILE, token, { mode: 0o600 });
+interface ProfilesStore {
+  default: string | null;
+  profiles: Record<string, Profile>;
 }
 
-export function removeToken(): void {
-  if (existsSync(TOKEN_FILE)) {
-    const { unlinkSync } = require("fs");
-    unlinkSync(TOKEN_FILE);
-  }
-}
-
-export const BASE_URL = process.env.${name.toUpperCase()}_BASE_URL ?? "https://api.example.com/v1";
+// ─── Global runtime flags (set by --profile in index.ts) ─────────────────────
 
 export const globalFlags = {
   json: false,
   format: "text",
   verbose: false,
-  noColor: false,
-  noHeader: false,
+  profile: null as string | null,
 };
+
+// ─── Profiles file I/O ────────────────────────────────────────────────────────
+
+function loadProfiles(): ProfilesStore {
+  // Migrate legacy single-file config on first read
+  if (!existsSync(PROFILES_FILE)) {
+    const legacyToken = join(CONFIG_DIR, "${name}-cli");
+    if (existsSync(legacyToken)) {
+      const token = readFileSync(legacyToken, "utf-8").trim();
+      const store: ProfilesStore = { default: "default", profiles: { default: { url: "http://localhost/api", token } } };
+      _saveProfiles(store);
+      return store;
+    }
+    return { default: null, profiles: {} };
+  }
+  try { return JSON.parse(readFileSync(PROFILES_FILE, "utf-8")) as ProfilesStore; }
+  catch { return { default: null, profiles: {} }; }
+}
+
+function _saveProfiles(store: ProfilesStore): void {
+  mkdirSync(CONFIG_DIR, { recursive: true });
+  writeFileSync(PROFILES_FILE, JSON.stringify(store, null, 2), { mode: 0o600 });
+}
+
+function _normalizeUrl(url: string): string {
+  return url.replace(/\\/$/, "");
+}
+
+// ─── Public profile API ───────────────────────────────────────────────────────
+
+export function listProfiles(): Record<string, Profile> {
+  return loadProfiles().profiles;
+}
+
+export function getDefaultProfileName(): string | null {
+  return loadProfiles().default;
+}
+
+export function getProfile(name: string): Profile | null {
+  return loadProfiles().profiles[name] ?? null;
+}
+
+export function getActiveProfile(): Profile | null {
+  if (process.env.${upper}_URL && process.env.${upper}_TOKEN) {
+    return { url: process.env.${upper}_URL!, token: process.env.${upper}_TOKEN! };
+  }
+  const store = loadProfiles();
+  const name = globalFlags.profile ?? store.default;
+  return name ? (store.profiles[name] ?? null) : null;
+}
+
+export function saveProfile(name: string, url: string, token: string, setDefault = false): void {
+  const store = loadProfiles();
+  store.profiles[name] = { url: _normalizeUrl(url), token };
+  if (setDefault || !store.default) store.default = name;
+  _saveProfiles(store);
+}
+
+export function deleteProfile(name: string): boolean {
+  const store = loadProfiles();
+  if (!store.profiles[name]) return false;
+  delete store.profiles[name];
+  if (store.default === name) {
+    const remaining = Object.keys(store.profiles);
+    store.default = remaining[0] ?? null;
+  }
+  _saveProfiles(store);
+  return true;
+}
+
+export function setDefaultProfile(name: string): boolean {
+  const store = loadProfiles();
+  if (!store.profiles[name]) return false;
+  store.default = name;
+  _saveProfiles(store);
+  return true;
+}
+
+// ─── Legacy single-profile helpers (used by auth command) ────────────────────
+
+export function getToken(): string | null {
+  return getActiveProfile()?.token ?? null;
+}
+
+export function getBaseUrl(): string {
+  return getActiveProfile()?.url ?? "http://localhost/api";
+}
+
+export function saveToken(token: string): void {
+  const store = loadProfiles();
+  const name = globalFlags.profile ?? store.default ?? "default";
+  const existing = store.profiles[name];
+  if (existing) { existing.token = token; _saveProfiles(store); }
+  else saveProfile(name, "http://localhost/api", token, true);
+}
+
+export function saveBaseUrl(url: string): void {
+  const store = loadProfiles();
+  const name = globalFlags.profile ?? store.default ?? "default";
+  const existing = store.profiles[name];
+  if (existing) { existing.url = _normalizeUrl(url); _saveProfiles(store); }
+  else saveProfile(name, url, "", true);
+}
+
+export function removeToken(): void {
+  const store = loadProfiles();
+  const name = globalFlags.profile ?? store.default;
+  if (name && store.profiles[name]) { store.profiles[name].token = ""; _saveProfiles(store); }
+}
 `;
 }
 
@@ -144,14 +248,14 @@ function templateLibClient(baseUrl: string, authType: string, authHeader: string
     ? `"Authorization": \`Bearer \${token}\``
     : `"${authHeader}": token`;
 
-  return `import { getToken, BASE_URL } from "./config.js";
+  return `import { getToken, getBaseUrl } from "./config.js";
 import { CliError } from "./errors.js";
 
 const TIMEOUT_MS = 30_000;
 
 function buildHeaders(): Record<string, string> {
   const token = getToken();
-  if (!token) throw new CliError(401, "No API token. Run: ${"{CLI_NAME}"} auth set <token>");
+  if (!token) throw new CliError(401, "No token. Run: ${"{CLI_NAME}"} profile add --name default --url <url> --token <token>");
   return {
     "Content-Type": "application/json",
     Accept: "application/json",
@@ -160,7 +264,8 @@ function buildHeaders(): Record<string, string> {
 }
 
 async function request(method: string, path: string, opts: { params?: Record<string, unknown>; body?: unknown } = {}): Promise<unknown> {
-  let url = \`\${BASE_URL}\${path}\`;
+  const url0 = getBaseUrl();
+  let url = \`\${url0}\${path}\`;
   if (opts.params) {
     const filtered = Object.fromEntries(
       Object.entries(opts.params).filter(([, v]) => v !== undefined && v !== "")
@@ -195,22 +300,30 @@ export const client = {
 
 function templateAuthCommand(name: string): string {
   return `import { Command } from "commander";
-import { getToken, saveToken, removeToken } from "../lib/config.js";
+import { getToken, saveToken, saveBaseUrl, getBaseUrl, removeToken } from "../lib/config.js";
 import { client } from "../lib/client.js";
 
-export const authCommand = new Command("auth").description("Manage API authentication");
+export const authCommand = new Command("auth").description("Manage authentication for the active profile");
 
 authCommand
   .command("set <token>")
-  .description("Save your API token")
+  .description("Save API token for the active profile")
   .action((token: string) => {
     saveToken(token);
     console.log("Token saved.");
   });
 
 authCommand
+  .command("url <url>")
+  .description("Set the base URL for the active profile")
+  .action((url: string) => {
+    saveBaseUrl(url);
+    console.log(\`URL saved: \${getBaseUrl()}\`);
+  });
+
+authCommand
   .command("show")
-  .description("Show current token (masked)")
+  .description("Show token for the active profile (masked)")
   .option("--reveal", "Show full token")
   .action((opts) => {
     const token = getToken();
@@ -220,7 +333,7 @@ authCommand
 
 authCommand
   .command("remove")
-  .description("Delete the saved token")
+  .description("Remove token for the active profile")
   .action(() => {
     removeToken();
     console.log("Token removed.");
@@ -228,11 +341,114 @@ authCommand
 
 authCommand
   .command("test")
-  .description("Test the API connection")
+  .description("Test the API connection for the active profile")
   .action(async () => {
     try {
       await client.get("/");
       console.log("Connection OK.");
+    } catch (err) {
+      console.error("Connection failed:", err instanceof Error ? err.message : err);
+      process.exit(1);
+    }
+  });
+`;
+}
+
+function templateProfileCommand(name: string): string {
+  return `import { Command } from "commander";
+import {
+  listProfiles,
+  getDefaultProfileName,
+  saveProfile,
+  deleteProfile,
+  setDefaultProfile,
+  getProfile,
+  globalFlags,
+} from "../lib/config.js";
+import { client } from "../lib/client.js";
+
+export const profileCommand = new Command("profile").description("Manage instances/profiles (multiple API endpoints)");
+
+profileCommand
+  .command("list")
+  .description("List all configured profiles")
+  .option("--json", "Output as JSON")
+  .action((opts) => {
+    const profiles = listProfiles();
+    const def = getDefaultProfileName();
+    if (opts.json) { console.log(JSON.stringify({ default: def, profiles }, null, 2)); return; }
+    const entries = Object.entries(profiles);
+    if (!entries.length) {
+      console.log("No profiles. Run: ${name}-cli profile add --name prod --url https://... --token ...");
+      return;
+    }
+    const rows = entries.map(([n, p]) => ({
+      name: n === def ? \`\${n} *\` : n,
+      url: p.url,
+      token: p.token ? \`\${p.token.slice(0, 6)}...\${p.token.slice(-3)}\` : "(none)",
+    }));
+    const w = { name: 4, url: 3, token: 5 };
+    for (const r of rows) { w.name = Math.max(w.name, r.name.length); w.url = Math.max(w.url, r.url.length); w.token = Math.max(w.token, r.token.length); }
+    const fmt = (r: typeof rows[0]) => \`  \${r.name.padEnd(w.name)}  \${r.url.padEnd(w.url)}  \${r.token}\`;
+    console.log(\`\\n  \${"NAME".padEnd(w.name)}  \${"URL".padEnd(w.url)}  TOKEN\\n  \${"─".repeat(w.name)}  \${"─".repeat(w.url)}  \${"─".repeat(w.token)}\`);
+    for (const r of rows) console.log(fmt(r));
+    console.log(\`\\n  * = default\\n\`);
+  });
+
+profileCommand
+  .command("add")
+  .description("Add or update a profile")
+  .requiredOption("--name <s>", "Profile name (e.g. prod, staging)")
+  .requiredOption("--url <s>",  "API base URL")
+  .requiredOption("--token <s>", "API token")
+  .option("--default", "Set as default profile")
+  .action((opts) => {
+    saveProfile(opts.name, opts.url, opts.token, opts.default ?? false);
+    console.log(\`✓ Profile '\${opts.name}' saved.\${opts.default ? " (set as default)" : ""}\`);
+  });
+
+profileCommand
+  .command("use <name>")
+  .description("Set the default profile")
+  .action((name) => {
+    if (!setDefaultProfile(name)) { console.error(\`Profile '\${name}' not found.\`); process.exit(1); }
+    console.log(\`✓ Default profile set to '\${name}'.\`);
+  });
+
+profileCommand
+  .command("show <name>")
+  .description("Show a profile's details")
+  .action((name) => {
+    const p = getProfile(name);
+    if (!p) { console.error(\`Profile '\${name}' not found.\`); process.exit(1); }
+    console.log(\`\\n  name   \${name}\\n  url    \${p.url}\\n  token  \${p.token ? \`\${p.token.slice(0, 6)}...\${p.token.slice(-3)}\` : "(none)"}\\n\`);
+  });
+
+profileCommand
+  .command("remove <name>")
+  .description("Remove a profile")
+  .option("--yes", "Skip confirmation")
+  .action(async (name, opts) => {
+    if (!opts.yes) {
+      process.stdout.write(\`Remove profile '\${name}'? [y/N] \`);
+      const answer = await new Promise<string>(r => process.stdin.once("data", d => r(d.toString().trim())));
+      if (!["y", "yes"].includes(answer.toLowerCase())) { console.log("Aborted."); return; }
+    }
+    if (!deleteProfile(name)) { console.error(\`Profile '\${name}' not found.\`); process.exit(1); }
+    console.log(\`✓ Profile '\${name}' removed.\`);
+  });
+
+profileCommand
+  .command("test [name]")
+  .description("Test connection for a profile (defaults to active profile)")
+  .action(async (name) => {
+    if (name) {
+      if (!getProfile(name)) { console.error(\`Profile '\${name}' not found.\`); process.exit(1); }
+      globalFlags.profile = name;
+    }
+    try {
+      await client.get("/");
+      console.log(\`✓ Connection OK\${name ? \` (\${name})\` : ""}.\`);
     } catch (err) {
       console.error("Connection failed:", err instanceof Error ? err.message : err);
       process.exit(1);
@@ -246,6 +462,7 @@ function templateIndex(name: string): string {
 import { Command } from "commander";
 import { globalFlags } from "./lib/config.js";
 import { authCommand } from "./commands/auth.js";
+import { profileCommand } from "./commands/profile.js";
 // import { exampleResource } from "./resources/example.js";
 
 const program = new Command();
@@ -255,15 +472,16 @@ program
   .description("CLI for the ${name} API")
   .version("0.1.0")
   .option("--json", "Output as JSON", false)
-  .option("--format <fmt>", "Output format: text, json, csv, yaml", "text")
+  .option("--profile <name>", "Use a specific profile (overrides default)")
   .option("--verbose", "Enable verbose logging", false)
   .hook("preAction", (_cmd, action) => {
     const o = action.optsWithGlobals();
-    globalFlags.json = o.json ?? false;
-    globalFlags.format = o.format ?? "text";
+    globalFlags.json    = o.json    ?? false;
     globalFlags.verbose = o.verbose ?? false;
+    globalFlags.profile = o.profile ?? null;
   });
 
+program.addCommand(profileCommand);
 program.addCommand(authCommand);
 // program.addCommand(exampleResource);
 
@@ -335,6 +553,7 @@ cliCommand
       "src/lib/client.ts": templateLibClient(opts.baseUrl, opts.authType, opts.authHeader)
         .replace(/\$\{"{CLI_NAME}"\}/g, `${name}-cli`),
       "src/commands/auth.ts": templateAuthCommand(name),
+      "src/commands/profile.ts": templateProfileCommand(name),
       "src/index.ts": templateIndex(name),
       "src/resources/example.ts": templateExampleResource(name),
     };
@@ -347,10 +566,12 @@ cliCommand
     console.log(`\nNext steps:`);
     console.log(`  cd ${dir}`);
     console.log(`  bun install`);
-    console.log(`  # edit src/resources/example.ts`);
     console.log(`  devctl cli bundle ${name}`);
     console.log(`  devctl cli link ${name}`);
-    console.log(`  devctl cli auth set <your-api-key>`);
+    console.log(`  ${name}-cli profile add --name default --url <base-url> --token <api-token>`);
+    console.log(`  # add more instances:`);
+    console.log(`  ${name}-cli profile add --name staging --url <staging-url> --token <token>`);
+    console.log(`  # edit src/resources/example.ts then devctl cli rebuild ${name}`);
   });
 
 cliCommand
@@ -429,6 +650,174 @@ cliCommand
       const isLinked = existsSync(join(BIN_DIR, `${name}-cli`));
       const status = hasDistrib ? (isLinked ? "built + linked" : "built") : "not built";
       console.log(`  ${name}-cli  [${status}]`);
+    }
+  });
+
+cliCommand
+  .command("migrate <name>")
+  .description("Upgrade an existing CLI to multi-profile support")
+  .option("--dry-run", "Show what would change without writing")
+  .action((name: string, opts) => {
+    const dir = getCliDir(name);
+    if (!existsSync(dir)) {
+      console.error(`CLI "${name}" not found at ${dir}`);
+      process.exit(1);
+    }
+
+    // Detect CLI name from package.json if available
+    let cliName = name;
+    const pkgPath = join(dir, "package.json");
+    if (existsSync(pkgPath)) {
+      try {
+        const pkg = JSON.parse(readFileSync(pkgPath, "utf-8"));
+        cliName = pkg.name?.replace(/-cli$/, "") ?? name;
+      } catch { /* ignore */ }
+    }
+
+    const overwrites: Record<string, string> = {};
+
+    // config.ts: only replace if it's still the old single-token format
+    const currentConfig = join(dir, "src/lib/config.ts");
+    if (!existsSync(currentConfig) || !readFileSync(currentConfig, "utf-8").includes("PROFILES_FILE")) {
+      overwrites["src/lib/config.ts"] = templateLibConfig(cliName);
+    }
+
+    // client.ts: only patch if it still uses the old BASE_URL import
+    const clientPath = join(dir, "src/lib/client.ts");
+    if (existsSync(clientPath)) {
+      const clientSrc = readFileSync(clientPath, "utf-8");
+      if (clientSrc.includes("BASE_URL") && clientSrc.includes("from \"./config.js\"")) {
+        overwrites["src/lib/client.ts"] = clientSrc
+          .replace(/import\s*\{([^}]*)\bBASE_URL\b([^}]*)\}\s*from\s*"\.\/config\.js"/, (_, pre, post) => {
+            const parts = (pre + post).split(",").map((s: string) => s.trim()).filter(Boolean);
+            if (!parts.includes("getBaseUrl")) parts.push("getBaseUrl");
+            return `import { ${parts.join(", ")} } from "./config.js"`;
+          })
+          .replace(/`\$\{BASE_URL\}/g, "`${getBaseUrl()}");
+      }
+    }
+
+    // auth.ts: only patch if it uses the old single-token imports
+    const authPath = join(dir, "src/commands/auth.ts");
+    if (existsSync(authPath)) {
+      const authSrc = readFileSync(authPath, "utf-8");
+      if (!authSrc.includes("saveBaseUrl")) {
+        overwrites["src/commands/auth.ts"] = templateAuthCommand(cliName);
+      }
+    }
+
+    // profile.ts: add if missing
+    const profilePath = join(dir, "src/commands/profile.ts");
+    if (!existsSync(profilePath)) {
+      overwrites["src/commands/profile.ts"] = templateProfileCommand(cliName);
+    }
+
+    // index.ts: patch to add --profile flag and profileCommand
+    const indexPath = join(dir, "src/index.ts");
+    if (existsSync(indexPath)) {
+      let src = readFileSync(indexPath, "utf-8");
+      let changed = false;
+
+      // Add profile import if missing
+      if (!src.includes("profileCommand")) {
+        src = src.replace(
+          /import \{ authCommand \} from "\.\/commands\/auth\.js";/,
+          `import { authCommand } from "./commands/auth.js";\nimport { profileCommand } from "./commands/profile.js";`
+        );
+        changed = true;
+      }
+
+      // Add --profile option if missing
+      if (!src.includes("--profile")) {
+        src = src.replace(
+          /\.option\("--json"/,
+          `.option("--profile <name>", "Use a specific profile (overrides default)")\n  .option("--json"`
+        );
+        changed = true;
+      }
+
+      // Add globalFlags.profile in hook if missing
+      if (!src.includes("globalFlags.profile")) {
+        // Match any assignment to globalFlags.json regardless of the variable name used
+        src = src.replace(
+          /globalFlags\.json\s*=[^\n]+\n/,
+          (m) => m + `    globalFlags.profile = (actionCmd ?? _cmd).optsWithGlobals().profile ?? null;\n`
+        );
+        changed = true;
+      }
+
+      // Register profileCommand if missing
+      if (!src.includes("addCommand(profileCommand)")) {
+        src = src.replace(
+          /program\.addCommand\(authCommand\)/,
+          `program.addCommand(profileCommand);\nprogram.addCommand(authCommand)`
+        );
+        changed = true;
+      }
+
+      if (changed) overwrites["src/index.ts"] = src;
+    }
+
+    // Scan all .ts files (excluding the ones we're overwriting) for imports
+    // of legacy config constants that won't exist in the new config.ts
+    const legacyConfigExports = ["TOKEN_PATH", "BASE_URL", "AUTH_TYPE", "AUTH_HEADER", "APP_CLI"];
+    const newConfigExports = [
+      "globalFlags", "getToken", "getBaseUrl", "saveToken", "saveBaseUrl", "removeToken",
+      "getActiveProfile", "getProfile", "listProfiles", "getDefaultProfileName",
+      "saveProfile", "deleteProfile", "setDefaultProfile", "Profile",
+    ];
+    const warnings: string[] = [];
+
+    const srcDir = join(dir, "src");
+    function scanDir(d: string) {
+      for (const entry of readdirSync(d, { withFileTypes: true })) {
+        const full = join(d, entry.name);
+        if (entry.isDirectory()) { scanDir(full); continue; }
+        if (!entry.name.endsWith(".ts")) continue;
+        const rel = full.replace(dir + "/", "");
+        if (overwrites[rel]) continue; // will be replaced anyway
+        const src = readFileSync(full, "utf-8");
+        // Find imports from config.js
+        const match = src.match(/import\s*\{([^}]+)\}\s*from\s*["'].*config\.js["']/);
+        if (!match) continue;
+        const imported = match[1].split(",").map((s: string) => s.trim().split(/\s+as\s+/)[0].trim());
+        const broken = imported.filter((i: string) => legacyConfigExports.includes(i) && !newConfigExports.includes(i));
+        if (broken.length > 0) {
+          warnings.push(`  ⚠  ${rel} imports { ${broken.join(", ")} } from config.ts — needs manual update`);
+        }
+      }
+    }
+    if (existsSync(srcDir)) scanDir(srcDir);
+
+    if (Object.keys(overwrites).length === 0 && warnings.length === 0) {
+      console.log(`✓ ${name}-cli is already up to date.`);
+      return;
+    }
+
+    console.log(`\nMigrating ${name}-cli to multi-profile support:\n`);
+    for (const rel of Object.keys(overwrites)) {
+      const exists = existsSync(join(dir, rel));
+      console.log(`  ${exists ? "update" : "create"}  ${rel}`);
+    }
+
+    if (warnings.length > 0) {
+      console.log(`\nManual fixes required after migration:\n${warnings.join("\n")}`);
+      console.log(`  → Replace legacy config imports with getActiveProfile(), saveToken(), etc.`);
+    }
+
+    if (opts.dryRun) {
+      console.log("\n(dry run — nothing written)");
+      return;
+    }
+
+    for (const [rel, content] of Object.entries(overwrites)) {
+      writeFileSync(join(dir, rel), content, "utf-8");
+    }
+
+    if (warnings.length > 0) {
+      console.log(`\n⚠  Migration done with warnings — fix the files above before rebuilding.`);
+    } else {
+      console.log(`\n✓ Migration done. Run: devctl cli rebuild ${name}`);
     }
   });
 
